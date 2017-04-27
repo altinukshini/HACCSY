@@ -43,8 +43,6 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
 
-
-
 ##################################
 # LOGS
 ##################################
@@ -124,7 +122,6 @@ GPIO.output(DoorLockPin, LOCKED)
 # Other variables
 ##################################
 
-
 # comment out the device you are not using.
 # in this case we have our RFID reader hooked to the usb port
 # not GPIO UART pins
@@ -140,8 +137,14 @@ SERIALDEVICE = '/dev/hidraw0' #USB serial
 WHITELISTFILENAME = 'whitelist.txt'
 WHITELISTPATH = "/home/pi/" + WHITELISTFILENAME
 
-#this message is shown on the LCD screen while it waits for an RFID card swipe.
-readyMessage = "Prishtina\nHackerspace"
+# This string contains the domain in which the Seltzer crm is installed
+SELTZERSERVER = "www.yourseltzerserver.com"
+
+# This message is shown on the LCD screen while it waits for an RFID card swipe.
+READYMESSAGE = "Prishtina\nHackerspace"
+
+# HACCSY Administrator to send notification emails to
+HACCSYADMIN = "youremail@example.com"
 
 
 ####################
@@ -173,9 +176,10 @@ lcd = None
 # Returns True if host is reachable
 def is_connected():
   try:
+  	global SELTZERSERVER
 	# see if we can resolve the host name -- tells us if there is
 	# a DNS listening
-	host = socket.gethostbyname('www.yourseltzerserver.org')
+	host = socket.gethostbyname(SELTZERSERVER)
 	# connect to the host -- tells us if the host is actually
 	# reachable
 	s = socket.create_connection((host, 80), 2)
@@ -189,23 +193,12 @@ def initLCDScreen():
 	# set up the LCD object for writing messages
 	try:
 		global lcd
-		global readyMessage
+		global READYMESSAGE
 
 		HACCSY_app_log.info("Initializing LCD screen.")
 
 		lcd = LCD.Adafruit_CharLCD(lcd_rs, lcd_en, lcd_d4, lcd_d5, lcd_d6, lcd_d7, lcd_columns, lcd_rows, lcd_backlight)
-
 		lcd.clear()
-		lcd.message('Initializing.')
-		time.sleep(0.5)
-
-		lcd.clear()
-		lcd.message('Initializing..')
-		time.sleep(0.5)
-
-		lcd.clear()
-		lcd.message('Initializing...')
-		time.sleep(0.5)
 
 		HACCSY_app_log.info("LCD screen initialized OK!")
 	except Exception as ex:
@@ -247,9 +240,25 @@ def readLocalWhitelist():
 	except Exception:
 		HACCSY_app_log.info('Whitelist not found or empty or badly formatted JSON.')
 	
-	HACCSY_app_log.info('Read whitelist file OK. Got whitelist: ' + str(serialWhiteList))
+	HACCSY_app_log.info('Read whitelist file OK.')
 	
 	return serialWhiteList
+
+# Reads local whitelist and member name if rfid matches
+def getMemberNameFromWhitelist(match):
+	HACCSY_app_log.info('Reading local whitelist file: ' + WHITELISTFILENAME)
+	memberName = ''
+	try:
+		with open(WHITELISTPATH, "r") as text_file:
+			whitelistData = json.load(text_file)
+			#pprint.pprint(whitelistData)
+			for record in whitelistData:
+				if record["serial"] == match:
+					memberName = record["firstName"] + " " + record["lastName"]
+	except Exception:
+		HACCSY_app_log.info('Whitelist not found or empty or badly formatted JSON.')
+	
+	return memberName
 
 # Connects with GMAIL smtp and sends an email as notification for specified actions
 def sendEmail(toEmail, emailSubject, emailMessage):
@@ -431,15 +440,11 @@ def RGBLED(color):
 # Blinks 2 color values from above 3 times 
 # You can use RGBLEDBlink("white", "off"), to turn RGB led on and off 3 times
 def RGBLEDBlink(color1, color2):
-	RGBLED(color1)
-	time.sleep(0.5)
-	RGBLED(color2)
-	time.sleep(0.5)
-	RGBLED(color1)
-	time.sleep(0.5)
-	RGBLED(color2)
-	time.sleep(0.5)
-	RGBLED(color1)
+	for i in range(2):
+		RGBLED(color1)
+		time.sleep(0.5)
+		RGBLED(color2)
+		time.sleep(0.5)
 
 # Writes a given message to LCD and sets a delay of 
 # X seconds (it helps to slow down messages when showing them one after the other)
@@ -471,10 +476,38 @@ def unlock_door(duration):
 	time.sleep(duration)
 	GPIO.output(DoorLockPin, LOCKED)
 	HACCSY_app_log.info("Door locked.")
-	writeLCDMessage(readyMessage,0)
+	writeLCDMessage(READYMESSAGE,0)
 	RGBLED("blue")
 
+def waitUserInput():
+	writeLCDMessage('Waiting user\ninput.',0.3)
+	writeLCDMessage('Waiting user\ninput..',0.3)
+	writeLCDMessage('Waiting user\ninput...',0.3)
 
+def processCheckINOUT(match):
+	# Communicate with REST API to process Check IN/OUT
+	checkInJsonResponse = Validator.processCheckIn(match)
+	HACCSY_app_log.info('processCheckIn() json response: ' + str(checkInJsonResponse))
+
+	return {
+		'hasErrors': checkInJsonResponse['hasErrors'],
+		'message': checkInJsonResponse['message'],
+		'firstName': checkInJsonResponse['firstName'],
+		'lastName': checkInJsonResponse['lastName'],
+	}
+
+def validateRFIDwRest(match):
+	jsonResponse = Validator.validate(match)
+	HACCSY_app_log.info('validate() json response: ' + str(jsonResponse))
+	HACCSY_app_log.info('validate() json string: ' + jsonResponse[0])
+
+	return jsonResponse[0]
+
+def validateIfCheckedIN(match):
+	jsonResponse = Validator.isUserCheckedIn(match)
+	HACCSY_app_log.info('isUserCheckedIn() json string: ' + jsonResponse[0])
+	
+	return jsonResponse[0]
 
 ##################################
 # Main
@@ -505,26 +538,31 @@ if __name__ == '__main__':
 	# HACCSY is ready!
 	writeLCDMessage('HACCSY ready!',1)
 
+	# Get notified if HACCSY gets rebooted
+	sendEmail(HACCSYADMIN, "[HACCSY] - System Rebooted", "HACCSY Rebooted")
+
+	# Sometimes the LCD screen is scrambeling text, I haven't figured out why but
+	# seems like reseting the LCD fixes the issue therefore I've decided to just
+	# reset every 2 runs for now...
+	resetLCD = 0
 
 	while True:
 
-		writeLCDMessage(readyMessage,0) # Write readyMessage on screen, indicate RPi RFID is waiting card swipe
+		if resetLCD == 2:
+			initLCDScreen()
+			resetLCD = 0
+		else:
+			resetLCD += 1
+
+		writeLCDMessage(READYMESSAGE,0) # Write READYMESSAGE on screen, indicate RPi RFID is waiting card swipe
 		RGBLED("blue") # Turn blue led on, indicate RPi RFID is waiting card swipe
 
 		# Wait for user input to swipe card
 		serialNo = getSerialNoFromDevice(SERIALDEVICE)
 		match = rfidPattern.sub('', serialNo)
 
+		HACCSY_app_log.info("-------------------------------------------------------")
 		HACCSY_app_log.info('RFID card scanned: ' + str(serialNo))
-
-		# writeLCDMessage('Press & Hold\nbutton',1)
-		# writeLCDMessage('to: Check IN/OUT',1)
-		
-		# writeLCDMessage('Waiting user\ninput... 2',1)
-		writeLCDMessage('Waiting user\ninput.',0.3)
-		writeLCDMessage('Waiting user\ninput..',0.3)
-		writeLCDMessage('Waiting user\ninput...',0.3)
-
 
 		#####################################################################################################
 		#######                                    ONLINE
@@ -537,6 +575,8 @@ if __name__ == '__main__':
 
 			if match:
 
+				waitUserInput()
+
 				# If user has pressed the Check IN/OUT button after swiping RFID card
 				# enter the Check IN/OUT process
 				if not GPIO.input(CheckinButtonPin):
@@ -548,6 +588,7 @@ if __name__ == '__main__':
 
 					CARDS = readLocalWhitelist()
 
+					# Check RFID in local whitelist first
 					if match in CARDS:
 
 						HACCSY_app_log.info('Card authorized via whitelist: ' + str(match))
@@ -556,23 +597,18 @@ if __name__ == '__main__':
 						writeLCDMessage('Whitelist OK!', 1)
 
 						# Communicate with REST API to process Check IN/OUT
-						checkInJsonResponse = Validator.processCheckIn(match)
-						HACCSY_app_log.info('processCheckIn() json response: ' + str(checkInJsonResponse))
-						checkInJsonString_errors = checkInJsonResponse['hasErrors']
-						checkInJsonString_message = checkInJsonResponse['message']
-						checkInJsonString_firstName = checkInJsonResponse['firstName']
-						checkInJsonString_lastName = checkInJsonResponse['lastName']
+						jsonResponse = processCheckINOUT(match)
 
-						if (checkInJsonString_errors == 0):
+						if (jsonResponse['hasErrors'] == 0):
 
-							HACCSY_app_log.info('processCheckIn() json string: ' + str(checkInJsonString_errors) + ' errors | ' + checkInJsonString_firstName + ' ' + checkInJsonString_lastName + ' | ' + str(match) + ' | ' + checkInJsonString_message)
+							HACCSY_app_log.info('processCheckIn() json string: ' + str(jsonResponse['hasErrors']) + ' errors | ' + jsonResponse['firstName'] + ' ' + jsonResponse['lastName'] + ' | ' + str(match) + ' | ' + jsonResponse['message'])
 							
-							if (checkInJsonString_message == "Checkin successful!"):
+							if (jsonResponse['message'] == "Checkin successful!"):
 
 								HACCSY_app_log.info('Checked IN. ACCESS GRANTED: ' + str(match))
 
 								writeLCDMessage('Check IN\nsuccessful!',1)
-								writeLCDMessage('Happy Hacking\n' + checkInJsonString_firstName,1)
+								writeLCDMessage('Happy Hacking\n' + jsonResponse['firstName'],1)
 								writeLCDMessage('Access Granted!',0)
 							   
 								HACCSY_app_log.info('UNLOCKING DOOR')
@@ -584,13 +620,13 @@ if __name__ == '__main__':
 								# PRINT LCD
 								RGBLED("green")
 								writeLCDMessage('Check OUT\nsuccessful!',1)
-								writeLCDMessage('Bye ' + checkInJsonString_firstName,2)
+								writeLCDMessage('Bye ' + jsonResponse['firstName'],2)
 
 						else :
 
 							# PRINT LCD
-							writeLCDMessage('ERROR:\n' + checkInJsonString_message,5)
-							HACCSY_app_log.info('ERROR: Could not Check IN/OUT user. | ' + checkInJsonString_message )
+							writeLCDMessage('ERROR:\n' + jsonResponse['message'],5)
+							HACCSY_app_log.info('ERROR: Could not Check IN/OUT user. | ' + jsonResponse['hasErrors'] )
 
 
 					else:
@@ -598,37 +634,28 @@ if __name__ == '__main__':
 						HACCSY_app_log.info('RFID not found in whitelist. Checking with REST: ' + str(match))
 
 						#not in the local whitelist, check REST web service
-						jsonResponse = Validator.validate(match)
-						HACCSY_app_log.info('validate() json response: ' + str(jsonResponse))
-						jsonString = jsonResponse[0]
-						HACCSY_app_log.info('validate() json string: ' + jsonString)
+						jsonValidationString = validateRFIDwRest(match)
 
-						if (jsonString == "True"):
+						if (jsonValidationString == "True"):
 
 							HACCSY_app_log.info('Card authorized via REST service.')
 
 							# PRINT LCD
 							writeLCDMessage('Auth w/ REST',1)
 
-							checkInJsonResponse = Validator.processCheckIn(match)
-							HACCSY_app_log.info('processCheckIn() json response: ' + str(checkInJsonResponse))
-							checkInJsonString_errors = checkInJsonResponse['hasErrors']
-							checkInJsonString_message = checkInJsonResponse['message']
-							checkInJsonString_firstName = checkInJsonResponse['firstName']
-							checkInJsonString_lastName = checkInJsonResponse['lastName']
+							jsonResponse = processCheckINOUT(match)
 
+							if (jsonResponse['hasErrors'] == 0):
 
-							if (checkInJsonString_errors == 0):
-
-								HACCSY_app_log.info('processCheckIn() json string: ' + str(checkInJsonString_errors) + ' errors | ' + checkInJsonString_firstName + ' ' + checkInJsonString_lastName + ' | ' + str(match) + ' | ' + checkInJsonString_message)
+								HACCSY_app_log.info('processCheckIn() json string: ' + str(jsonResponse['hasErrors']) + ' errors | ' + jsonResponse['firstName'] + ' ' + jsonResponse['lastName'] + ' | ' + str(match) + ' | ' + jsonResponse['message'])
 								
-								if (checkInJsonString_message == "Checkin successful!"):
+								if (jsonResponse['message'] == "Checkin successful!"):
 
 									HACCSY_app_log.info('Checked IN. ACCESS GRANTED: ' + str(match))
 
 									# PRINT LCD
 									writeLCDMessage('Check IN\nsuccessful!',1)
-									writeLCDMessage('Happy Hacking\n' + checkInJsonString_firstName,1)
+									writeLCDMessage('Happy Hacking\n' + jsonResponse['firstName'], 1)
 									writeLCDMessage('Access Granted!',0)
 									
 									HACCSY_app_log.info('UNLOCKING DOOR')
@@ -636,18 +663,18 @@ if __name__ == '__main__':
 
 								else :
 
-									FID_app_log.info('Checked OUT:' + str(match))
+									HACCSY_app_log.info('Checked OUT:' + str(match))
 
 									# PRINT LCD
+									RGBLED("green")
 									writeLCDMessage('Check OUT\nsuccessful!',1)
-									writeLCDMessage('Bye ' + checkInJsonString_firstName,2)
+									writeLCDMessage('Bye ' + jsonResponse['firstName'],2)
 									
 
 							else :
 
-								writeLCDMessage('ERROR:\n' + checkInJsonString_message,2)
-
-								HACCSY_app_log.info('ERROR: Could not Check IN/OUT user. | ' + checkInJsonString_message )
+								writeLCDMessage('ERROR:\n' + jsonResponse['message'],2)
+								HACCSY_app_log.info('ERROR: Could not Check IN/OUT user. | ' + jsonResponse['message'] )
 
 						else:
 
@@ -656,10 +683,9 @@ if __name__ == '__main__':
 							RGBLED("red")
 							writeLCDMessage('Unauthorized\nAccess Denied!',1)
 
-							sendEmail("info@yourseltzerserver.com", "[HACCSY] - UNAUTHORIZED ACCESS ", "ONLINE MODE\n===>Check IN/OUT Button pressed\n==>RFID not in whitelist, checked with REST:\nRFID serial not found or member payments are due.\nRFID: " + serialNo)
+							sendEmail(HACCSYADMIN, "[HACCSY] - UNAUTHORIZED ACCESS ", "Mode: ONLINE\nButton pressed: YES\n\n------------------\n\nRFID: " + serialNo + "\nRFID not in whitelist, checked with REST:\nREST response: " + str(jsonValidationString))
 
 				else :
-
 
 					HACCSY_app_log.info("Check IN/OUT Button ((NOT)) pressed")
 
@@ -670,17 +696,16 @@ if __name__ == '__main__':
 
 					if match in CARDS:
 
-						jsonResponse = Validator.isUserCheckedIn(match)
-						jsonString = jsonResponse[0]
-						HACCSY_app_log.info('isUserCheckedIn() json string: ' + jsonString)
-
 						HACCSY_app_log.info('Card authorized via whitelist: ' + str(match))
+
+						# Check if user is checked in beforehand
+						jsonValidationString = validateIfCheckedIN(match)
 						
-						if (jsonString == "True"):
+						if (jsonValidationString == "True"):
 
 							writeLCDMessage('Access Granted!',0)
 							
-							HACCSY_app_log.info('Member already Checked IN | Member card: ' + str(match))
+							HACCSY_app_log.info('Member already Checked IN | '+ getMemberNameFromWhitelist(match) +' | Member card: ' + str(match))
 
 							HACCSY_app_log.info('UNLOCKING DOOR')
 							unlock_door(5)
@@ -693,8 +718,7 @@ if __name__ == '__main__':
 
 							HACCSY_app_log.info('Access Denied, Member was not Checked IN | Member card: ' + str(match))
 
-							sendEmail("info@yourseltzerserver.com", "[HACCSY] - UNAUTHORIZED ACCESS ", "ONLINE MODE\n===>Check IN/OUT Button NOT pressed\nUser tried to access without Checking IN.\nRFID: " + serialNo)
-
+							sendEmail(HACCSYADMIN, "[HACCSY] - UNAUTHORIZED ACCESS ", "Mode: ONLINE\nButton pressed: NO\n\n------------------\n\nRFID: " + serialNo + "\nUser tried to access without Checking IN.")
 
 					else:
 
@@ -703,8 +727,7 @@ if __name__ == '__main__':
 						RGBLED("red")
 						writeLCDMessage('Unauthorized.\nAccess Denied!',1)
 
-						sendEmail("info@yourseltzerserver.com", "[HACCSY] - UNAUTHORIZED ACCESS ", "ONLINE MODE\n===>Check IN/OUT Button NOT pressed\nRFID serial not found or member payments are due.\nRFID: " + serialNo)
-
+						sendEmail(HACCSYADMIN, "[HACCSY] - UNAUTHORIZED ACCESS ", "Mode: ONLINE\nButton pressed: NO\n\n------------------\n\nRFID: " + serialNo + "\nREST response: " + str(jsonValidationString) + "\nUser tried to access without Checking IN.")
 
 		#####################################################################################################
 		#######                                    OFFLINE
@@ -712,6 +735,8 @@ if __name__ == '__main__':
 
 		# Offline mode only uses the local whitelist, no REST
 		else :
+
+			writeLCDMessage('HACCSY OFFLINE!...',0.5)
 
 			RGBLEDBlink("white", "off")
 
@@ -726,17 +751,14 @@ if __name__ == '__main__':
 
 				if match in CARDS:
 
-					HACCSY_app_log.info('OFFLINE - ' + 'Card authorized via whitelist: ' + str(match))
-
-					# PRINT LCD
-					writeLCDMessage('Whitelist OK!',1)
-
-					HACCSY_app_log.info('OFFLINE - ACCESS GRANTED for RFID: ' + str(match))
-
 					# PRINT LCD
 					writeLCDMessage('Access Granted!\nWelcome!',0)
+					writeLCDMessage('Whitelist OK!',1)
 
+					HACCSY_app_log.info('OFFLINE - ' + 'Card authorized via whitelist: ' + str(match))
+					HACCSY_app_log.info('OFFLINE - ACCESS GRANTED for RFID: ' + str(match))
 					HACCSY_app_log.info('OFFLINE - UNLOCKING DOOR')
+
 					unlock_door(5)
 
 				else:
